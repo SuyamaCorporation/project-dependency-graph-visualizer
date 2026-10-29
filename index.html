@@ -1,0 +1,460 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>プロジェクト 依存関係 グラフ ビジュアル</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-100 min-h-screen">
+  <header class="bg-blue-800 text-white px-6 py-4">
+    <h1 class="text-xl font-bold">プロジェクト 依存関係 グラフ ビジュアル</h1>
+    <p class="text-sm text-blue-200 mt-1">タスクと依存関係を入力 → DAG描画・クリティカルパスハイライト</p>
+  </header>
+
+  <main class="max-w-7xl mx-auto px-4 py-6 grid grid-cols-1 lg:grid-cols-3 gap-6">
+    <!-- 左ペイン: 入力 -->
+    <section aria-label="タスク入力" class="flex flex-col gap-4">
+      <div class="bg-white rounded-xl shadow p-4 flex flex-col gap-3">
+        <h2 class="font-semibold text-gray-700">依存関係入力</h2>
+        <p class="text-xs text-gray-500">1行につき 1エッジ。形式: <code class="bg-gray-100 px-1 rounded">TaskA-&gt;TaskB</code><br/>タスク名のみの行（エッジなし）も可。</p>
+        <textarea
+          id="dep-input"
+          rows="14"
+          class="font-mono text-sm border border-gray-300 rounded px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500 resize-y"
+          aria-label="依存関係テキスト入力"
+          placeholder="要件定義&#10;設計->要件定義&#10;実装->設計&#10;テスト->実装&#10;レビュー->実装&#10;デプロイ->テスト&#10;デプロイ->レビュー"
+          spellcheck="false"
+        ></textarea>
+        <div class="flex gap-2">
+          <button id="btn-sample" class="text-xs px-3 py-1 bg-blue-100 text-blue-700 rounded hover:bg-blue-200 focus:outline-none focus:ring-2 focus:ring-blue-500" aria-label="サンプルデータ">サンプル</button>
+          <button id="btn-clear" class="text-xs px-3 py-1 bg-gray-100 text-gray-600 rounded hover:bg-gray-200 focus:outline-none focus:ring-2 focus:ring-gray-400" aria-label="入力をクリア">クリア</button>
+          <button id="btn-save" class="text-xs px-3 py-1 bg-emerald-100 text-emerald-700 rounded hover:bg-emerald-200 focus:outline-none focus:ring-2 focus:ring-emerald-500" aria-label="LocalStorageに保存">保存</button>
+        </div>
+        <div id="parse-error" role="alert" aria-live="polite" class="text-red-600 text-xs hidden"></div>
+      </div>
+
+      <!-- 凡例 & 情報 -->
+      <div class="bg-white rounded-xl shadow p-4 flex flex-col gap-3">
+        <h2 class="font-semibold text-gray-700">情報</h2>
+        <div class="flex flex-col gap-2 text-xs">
+          <div class="flex items-center gap-2"><span class="w-4 h-4 rounded-full bg-red-500 flex-shrink-0"></span><span>クリティカルパス（最長経路）</span></div>
+          <div class="flex items-center gap-2"><span class="w-4 h-4 rounded-full bg-blue-500 flex-shrink-0"></span><span>通常ノード</span></div>
+          <div class="flex items-center gap-2"><span class="w-4 h-3 bg-gray-400 flex-shrink-0"></span><span>通常エッジ</span></div>
+          <div class="flex items-center gap-2"><span class="w-4 h-3 bg-red-400 flex-shrink-0"></span><span>クリティカルエッジ</span></div>
+        </div>
+        <div id="graph-info" class="text-xs text-gray-600 flex flex-col gap-1" aria-live="polite"></div>
+      </div>
+    </section>
+
+    <!-- 右ペイン: Canvas -->
+    <section class="lg:col-span-2 flex flex-col gap-4" aria-label="グラフ表示">
+      <div class="bg-white rounded-xl shadow p-4 flex flex-col gap-3 overflow-hidden">
+        <div class="flex items-center justify-between">
+          <h2 class="font-semibold text-gray-700">DAG グラフ</h2>
+          <span class="text-xs text-gray-400">ノードをドラッグして配置を変更</span>
+        </div>
+        <canvas
+          id="dag-canvas"
+          role="img"
+          aria-label="依存関係グラフキャンバス"
+          class="border border-gray-200 rounded w-full bg-gray-50"
+          style="min-height:420px;cursor:grab"
+        ></canvas>
+        <div id="loop-warning" role="alert" aria-live="polite" class="hidden text-red-700 bg-red-50 border border-red-200 rounded p-3 text-sm"></div>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const STORAGE_KEY = 'dag-visualizer-v1';
+    const SAMPLE = `要件定義
+設計->要件定義
+DB設計->要件定義
+実装->設計
+実装->DB設計
+テスト->実装
+レビュー->実装
+デプロイ->テスト
+デプロイ->レビュー
+リリース->デプロイ`;
+
+    const canvas = document.getElementById('dag-canvas');
+    const ctx = canvas.getContext('2d');
+    const loopWarning = document.getElementById('loop-warning');
+    const graphInfo = document.getElementById('graph-info');
+    const parseError = document.getElementById('parse-error');
+
+    let nodes = {};     // name -> { x, y, name }
+    let edges = [];     // { from, to }
+    let criticalNodes = new Set();
+    let criticalEdges = new Set();
+    let dragNode = null;
+    let dragOffX = 0, dragOffY = 0;
+
+    // --- Parse ---
+    function parseInput(text) {
+      const newNodes = {};
+      const newEdges = [];
+      const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+      for (const line of lines) {
+        if (line.includes('->')) {
+          const parts = line.split('->');
+          if (parts.length !== 2) continue;
+          const [from, to] = parts.map(p => p.trim());
+          if (!from || !to) continue;
+          if (!newNodes[from]) newNodes[from] = { name: from };
+          if (!newNodes[to]) newNodes[to] = { name: to };
+          newEdges.push({ from, to });
+        } else {
+          if (!newNodes[line]) newNodes[line] = { name: line };
+        }
+      }
+      return { newNodes, newEdges };
+    }
+
+    // --- Cycle detection (DFS) ---
+    function detectCycle(nodeNames, edgeList) {
+      const adj = {};
+      nodeNames.forEach(n => adj[n] = []);
+      edgeList.forEach(e => adj[e.from] && adj[e.from].push(e.to));
+      const WHITE = 0, GRAY = 1, BLACK = 2;
+      const color = {};
+      nodeNames.forEach(n => color[n] = WHITE);
+      const cycles = [];
+      function dfs(u, path) {
+        color[u] = GRAY;
+        for (const v of (adj[u] || [])) {
+          if (color[v] === GRAY) {
+            cycles.push([...path, u, v]);
+          } else if (color[v] === WHITE) {
+            dfs(v, [...path, u]);
+          }
+        }
+        color[u] = BLACK;
+      }
+      nodeNames.forEach(n => { if (color[n] === WHITE) dfs(n, []); });
+      return cycles;
+    }
+
+    // --- Longest path (critical path) ---
+    function computeCriticalPath(nodeNames, edgeList) {
+      // topological sort
+      const inDeg = {};
+      const adj = {};
+      nodeNames.forEach(n => { inDeg[n] = 0; adj[n] = []; });
+      edgeList.forEach(e => { adj[e.from].push(e.to); inDeg[e.to]++; });
+      const queue = nodeNames.filter(n => inDeg[n] === 0);
+      const topo = [];
+      const tmpInDeg = { ...inDeg };
+      while (queue.length > 0) {
+        const u = queue.shift();
+        topo.push(u);
+        adj[u].forEach(v => { tmpInDeg[v]--; if (tmpInDeg[v] === 0) queue.push(v); });
+      }
+      // dp longest path
+      const dist = {};
+      const prev = {};
+      nodeNames.forEach(n => { dist[n] = 0; prev[n] = null; });
+      for (const u of topo) {
+        adj[u].forEach(v => {
+          if (dist[u] + 1 > dist[v]) { dist[v] = dist[u] + 1; prev[v] = u; }
+        });
+      }
+      // find end of critical path
+      const maxDist = Math.max(...nodeNames.map(n => dist[n]));
+      let end = nodeNames.find(n => dist[n] === maxDist);
+      const cpNodes = new Set();
+      const cpEdges = new Set();
+      let cur = end;
+      while (cur !== null) {
+        cpNodes.add(cur);
+        if (prev[cur] !== null) cpEdges.add(prev[cur] + '->' + cur);
+        cur = prev[cur];
+      }
+      return { cpNodes, cpEdges, maxDist };
+    }
+
+    // --- Layout: topological layered ---
+    function layoutNodes(nodeNames, edgeList, W, H) {
+      if (nodeNames.length === 0) return {};
+      const adj = {};
+      const inDeg = {};
+      nodeNames.forEach(n => { adj[n] = []; inDeg[n] = 0; });
+      edgeList.forEach(e => { if (adj[e.from]) { adj[e.from].push(e.to); inDeg[e.to]++; } });
+
+      // BFS layers
+      const layers = [];
+      const layerOf = {};
+      const queue = nodeNames.filter(n => inDeg[n] === 0);
+      let remaining = new Set(nodeNames);
+      while (remaining.size > 0) {
+        const layer = queue.filter(n => remaining.has(n));
+        if (layer.length === 0) {
+          // cycle fallback: just add remaining
+          remaining.forEach(n => { layers.push([n]); remaining.delete(n); });
+          break;
+        }
+        layers.push(layer);
+        layer.forEach(n => {
+          remaining.delete(n);
+          layerOf[n] = layers.length - 1;
+        });
+        queue.length = 0;
+        layer.forEach(n => {
+          adj[n].forEach(v => {
+            inDeg[v]--;
+            if (inDeg[v] === 0 && remaining.has(v)) queue.push(v);
+          });
+        });
+      }
+
+      const pad = 60;
+      const positions = {};
+      const layerCount = layers.length;
+      layers.forEach((layer, li) => {
+        const x = pad + (li / Math.max(layerCount - 1, 1)) * (W - pad * 2);
+        layer.forEach((n, ni) => {
+          const y = pad + (ni / Math.max(layer.length - 1, 1)) * (H - pad * 2);
+          positions[n] = {
+            x: isNaN(x) ? W / 2 : x,
+            y: layer.length === 1 ? H / 2 : (isNaN(y) ? H / 2 : y)
+          };
+        });
+      });
+      return positions;
+    }
+
+    // --- Draw ---
+    const NODE_R = 24;
+    function drawArrow(fromX, fromY, toX, toY, color, lineWidth) {
+      const dx = toX - fromX, dy = toY - fromY;
+      const len = Math.sqrt(dx * dx + dy * dy);
+      if (len < 1) return;
+      const ux = dx / len, uy = dy / len;
+      const sx = fromX + ux * NODE_R;
+      const sy = fromY + uy * NODE_R;
+      const ex = toX - ux * NODE_R;
+      const ey = toY - uy * NODE_R;
+      ctx.beginPath();
+      ctx.moveTo(sx, sy);
+      ctx.lineTo(ex, ey);
+      ctx.strokeStyle = color;
+      ctx.lineWidth = lineWidth;
+      ctx.stroke();
+      // arrowhead
+      const angle = Math.atan2(ey - sy, ex - sx);
+      const aLen = 10;
+      ctx.beginPath();
+      ctx.moveTo(ex, ey);
+      ctx.lineTo(ex - aLen * Math.cos(angle - 0.4), ey - aLen * Math.sin(angle - 0.4));
+      ctx.lineTo(ex - aLen * Math.cos(angle + 0.4), ey - aLen * Math.sin(angle + 0.4));
+      ctx.closePath();
+      ctx.fillStyle = color;
+      ctx.fill();
+    }
+
+    function draw() {
+      const W = canvas.clientWidth || 600;
+      const H = Math.max(canvas.clientHeight || 420, 420);
+      canvas.width = W;
+      canvas.height = H;
+      ctx.clearRect(0, 0, W, H);
+
+      const nodeNames = Object.keys(nodes);
+      if (nodeNames.length === 0) {
+        ctx.fillStyle = '#9ca3af';
+        ctx.font = '14px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText('依存関係を入力してください', W / 2, H / 2);
+        return;
+      }
+
+      // ensure positions exist
+      nodeNames.forEach(n => {
+        if (!nodes[n].x) {
+          const pos = layoutNodes(nodeNames, edges, W, H);
+          nodeNames.forEach(nn => { nodes[nn].x = pos[nn] ? pos[nn].x : W / 2; nodes[nn].y = pos[nn] ? pos[nn].y : H / 2; });
+        }
+      });
+
+      // draw edges
+      edges.forEach(e => {
+        const from = nodes[e.from], to = nodes[e.to];
+        if (!from || !to) return;
+        const isCritical = criticalEdges.has(e.from + '->' + e.to);
+        drawArrow(from.x, from.y, to.x, to.y, isCritical ? '#ef4444' : '#94a3b8', isCritical ? 2.5 : 1.5);
+      });
+
+      // draw nodes
+      nodeNames.forEach(n => {
+        const nd = nodes[n];
+        const isCritical = criticalNodes.has(n);
+        ctx.beginPath();
+        ctx.arc(nd.x, nd.y, NODE_R, 0, Math.PI * 2);
+        ctx.fillStyle = isCritical ? '#fee2e2' : '#dbeafe';
+        ctx.fill();
+        ctx.strokeStyle = isCritical ? '#ef4444' : '#3b82f6';
+        ctx.lineWidth = isCritical ? 2.5 : 1.5;
+        ctx.stroke();
+        ctx.fillStyle = '#1e293b';
+        ctx.font = '11px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        // wrap long text
+        const label = n.length > 6 ? n.slice(0, 5) + '…' : n;
+        ctx.fillText(label, nd.x, nd.y);
+      });
+    }
+
+    function updateGraph() {
+      const text = document.getElementById('dep-input').value;
+      const { newNodes, newEdges } = parseInput(text);
+      parseError.classList.add('hidden');
+      loopWarning.classList.add('hidden');
+
+      const nodeNames = Object.keys(newNodes);
+
+      // detect cycles
+      const cycles = detectCycle(nodeNames, newEdges);
+      if (cycles.length > 0) {
+        loopWarning.textContent = '依存ループを検出しました: ' + cycles.map(c => c.join(' → ')).join(' / ');
+        loopWarning.classList.remove('hidden');
+        criticalNodes = new Set();
+        criticalEdges = new Set();
+      } else {
+        try {
+          const cp = computeCriticalPath(nodeNames, newEdges);
+          criticalNodes = cp.cpNodes;
+          criticalEdges = cp.cpEdges;
+          const p1 = document.createElement('p');
+          p1.textContent = 'ノード数: ' + nodeNames.length + ' / エッジ数: ' + newEdges.length;
+          const p2 = document.createElement('p');
+          p2.textContent = 'クリティカルパス長: ' + cp.maxDist + ' ステップ';
+          const p3 = document.createElement('p');
+          p3.textContent = 'CP: ' + Array.from(cp.cpNodes).join(' → ');
+          p3.className = 'text-red-600 font-medium';
+          while (graphInfo.firstChild) graphInfo.removeChild(graphInfo.firstChild);
+          graphInfo.appendChild(p1);
+          graphInfo.appendChild(p2);
+          graphInfo.appendChild(p3);
+        } catch {}
+      }
+
+      // merge nodes (preserve positions)
+      const prevNodes = nodes;
+      nodes = {};
+      nodeNames.forEach(n => {
+        nodes[n] = prevNodes[n] || newNodes[n];
+        if (!nodes[n].x) {
+          const W = canvas.clientWidth || 600;
+          const H = 420;
+          const pos = layoutNodes(nodeNames, newEdges, W, H);
+          nodeNames.forEach(nn => {
+            if (!nodes[nn] || !nodes[nn].x) {
+              nodes[nn] = nodes[nn] || {};
+              nodes[nn].x = pos[nn] ? pos[nn].x : W / 2;
+              nodes[nn].y = pos[nn] ? pos[nn].y : H / 2;
+              nodes[nn].name = nn;
+            }
+          });
+        }
+      });
+
+      edges = newEdges;
+
+      // Re-layout if no positions yet
+      const needLayout = nodeNames.some(n => !nodes[n] || !nodes[n].x);
+      if (needLayout) {
+        const W = canvas.clientWidth || 600;
+        const H = 420;
+        const pos = layoutNodes(nodeNames, newEdges, W, H);
+        nodeNames.forEach(n => {
+          if (!nodes[n] || !nodes[n].x) {
+            nodes[n] = nodes[n] || {};
+            nodes[n].x = pos[n] ? pos[n].x : W / 2;
+            nodes[n].y = pos[n] ? pos[n].y : H / 2;
+            nodes[n].name = n;
+          }
+        });
+      }
+
+      draw();
+    }
+
+    // --- Drag ---
+    function getNodeAt(mx, my) {
+      return Object.keys(nodes).find(n => {
+        const nd = nodes[n];
+        return Math.sqrt((nd.x - mx) ** 2 + (nd.y - my) ** 2) <= NODE_R;
+      });
+    }
+
+    function canvasCoords(e) {
+      const rect = canvas.getBoundingClientRect();
+      const touch = e.touches ? e.touches[0] : e;
+      return [touch.clientX - rect.left, touch.clientY - rect.top];
+    }
+
+    canvas.addEventListener('mousedown', e => {
+      const [mx, my] = canvasCoords(e);
+      dragNode = getNodeAt(mx, my);
+      if (dragNode) {
+        dragOffX = mx - nodes[dragNode].x;
+        dragOffY = my - nodes[dragNode].y;
+        canvas.style.cursor = 'grabbing';
+      }
+    });
+    canvas.addEventListener('mousemove', e => {
+      if (!dragNode) return;
+      const [mx, my] = canvasCoords(e);
+      nodes[dragNode].x = mx - dragOffX;
+      nodes[dragNode].y = my - dragOffY;
+      draw();
+    });
+    canvas.addEventListener('mouseup', () => { dragNode = null; canvas.style.cursor = 'grab'; });
+    canvas.addEventListener('mouseleave', () => { dragNode = null; });
+
+    document.getElementById('dep-input').addEventListener('input', () => {
+      updateGraph();
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({ text: document.getElementById('dep-input').value }));
+    });
+    document.getElementById('btn-sample').addEventListener('click', () => {
+      document.getElementById('dep-input').value = SAMPLE;
+      nodes = {};
+      updateGraph();
+    });
+    document.getElementById('btn-clear').addEventListener('click', () => {
+      document.getElementById('dep-input').value = '';
+      nodes = {};
+      edges = [];
+      criticalNodes = new Set();
+      criticalEdges = new Set();
+      while (graphInfo.firstChild) graphInfo.removeChild(graphInfo.firstChild);
+      draw();
+      localStorage.removeItem(STORAGE_KEY);
+    });
+    document.getElementById('btn-save').addEventListener('click', () => {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({ text: document.getElementById('dep-input').value }));
+      const btn = document.getElementById('btn-save');
+      const orig = btn.textContent;
+      btn.textContent = '保存済';
+      setTimeout(() => { btn.textContent = orig; }, 1500);
+    });
+
+    window.addEventListener('resize', () => { nodes = {}; updateGraph(); });
+
+    // restore
+    const saved = localStorage.getItem(STORAGE_KEY);
+    if (saved) {
+      try {
+        const data = JSON.parse(saved);
+        if (data.text) { document.getElementById('dep-input').value = data.text; }
+      } catch {}
+    } else {
+      document.getElementById('dep-input').value = SAMPLE;
+    }
+    updateGraph();
+  </script>
+</body>
+</html>
